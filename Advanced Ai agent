@@ -1,0 +1,663 @@
+"""
+Broski AI - Advanced Personal Assistant Backend
+Designed for Linux first, with Windows fallbacks.
+
+Core features:
+- Voice input + text commands
+- Text-to-speech
+- OpenAI-powered conversational fallback
+- Wikipedia search
+- Website/app launcher with allowlists
+- Time/date/system status
+- Calculator
+- Notes
+- Flask API for index.html / Broski web UI
+- Health/status endpoint
+- Simple command router that is easy to extend
+
+Install:
+    pip install flask python-dotenv openai SpeechRecognition pyttsx3 wikipedia psutil
+
+Linux microphone support may also need:
+    sudo apt install portaudio19-dev python3-pyaudio espeak-ng
+
+Create .env:
+    OPENAI_API_KEY=your_api_key_here
+    OPENAI_MODEL=gpt-4o-mini
+
+Run:
+    python broski.py
+
+Web UI:
+    http://127.0.0.1:5000
+"""
+
+from __future__ import annotations
+
+import ast
+import datetime as dt
+import os
+import platform
+import re
+import subprocess
+import threading
+import webbrowser
+from pathlib import Path
+from typing import Any
+
+from dotenv import load_dotenv
+from flask import Flask, jsonify, request
+import wikipedia
+import speech_recognition as sr
+import pyttsx3
+
+try:
+    import psutil
+except ImportError:
+    psutil = None
+
+try:
+    from openai import OpenAI
+except ImportError:
+    OpenAI = None
+
+
+# ============================================================
+# Configuration
+# ============================================================
+
+load_dotenv()
+
+APP_NAME = "Broski"
+HOST = os.getenv("BROSKI_HOST", "127.0.0.1")
+PORT = int(os.getenv("BROSKI_PORT", "5000"))
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+
+BASE_DIR = Path(__file__).resolve().parent
+NOTES_FILE = BASE_DIR / "broski_notes.txt"
+
+app = Flask(__name__)
+
+# Keep browser actions explicitly allowlisted.
+SITES = {
+    "youtube": "https://www.youtube.com",
+    "google": "https://www.google.com",
+    "wikipedia": "https://www.wikipedia.org",
+    "github": "https://github.com",
+    "gmail": "https://mail.google.com",
+}
+
+# Linux commands first; Windows fallbacks are included.
+APP_COMMANDS = {
+    "terminal": {
+        "linux": ["gnome-terminal"],
+        "windows": ["cmd.exe"],
+    },
+    "calculator": {
+        "linux": ["gnome-calculator"],
+        "windows": ["calc.exe"],
+    },
+    "code": {
+        "linux": ["code"],
+        "windows": ["code"],
+    },
+    "files": {
+        "linux": ["xdg-open", str(Path.home())],
+        "windows": ["explorer.exe", str(Path.home())],
+    },
+}
+
+
+# ============================================================
+# TTS
+# ============================================================
+
+def create_tts_engine():
+    """Create a TTS engine that works on Linux and Windows."""
+    try:
+        if platform.system() == "Windows":
+            engine = pyttsx3.init("sapi5")
+        else:
+            engine = pyttsx3.init()  # Usually uses espeak/espeak-ng on Linux.
+
+        voices = engine.getProperty("voices")
+        if voices:
+            # Use the first available voice; this is more portable than
+            # assuming a particular voice ID.
+            engine.setProperty("voice", voices[0].id)
+
+        engine.setProperty("rate", 175)
+        engine.setProperty("volume", 1.0)
+        return engine
+    except Exception as exc:
+        print(f"[TTS] Could not initialize: {exc}")
+        return None
+
+
+tts_engine = create_tts_engine()
+tts_lock = threading.Lock()
+
+
+def speak(text: str) -> None:
+    """Speak text without crashing Broski if TTS is unavailable."""
+    text = str(text).strip()
+    if not text:
+        return
+
+    print(f"Broski: {text}")
+
+    if tts_engine is None:
+        return
+
+    try:
+        with tts_lock:
+            tts_engine.say(text)
+            tts_engine.runAndWait()
+    except Exception as exc:
+        print(f"[TTS] Error: {exc}")
+
+
+# ============================================================
+# OpenAI
+# ============================================================
+
+openai_client = None
+
+if OpenAI and OPENAI_API_KEY:
+    try:
+        openai_client = OpenAI(api_key=OPENAI_API_KEY)
+    except Exception as exc:
+        print(f"[OpenAI] Initialization failed: {exc}")
+
+
+SYSTEM_PROMPT = """
+You are Broski, a helpful personal AI assistant.
+You are running locally on the user's computer.
+Be concise, practical, and friendly.
+Do not claim that you performed an action unless the local command router
+actually performed it.
+When a request requires a local computer action, prefer the supported
+Broski commands rather than pretending to control the computer.
+"""
+
+
+def ask_ai(message: str) -> str:
+    """Use OpenAI when configured; otherwise return a useful local message."""
+    if openai_client is None:
+        return (
+            "My AI API is not connected yet. I can still handle local commands "
+            "such as opening websites, time, Wikipedia, calculator, notes, and apps."
+        )
+
+    try:
+        response = openai_client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": message},
+            ],
+            temperature=0.4,
+        )
+
+        answer = response.choices[0].message.content
+        return answer.strip() if answer else "I could not generate a response."
+    except Exception as exc:
+        print(f"[OpenAI] Error: {exc}")
+        return "I could not reach the AI service right now."
+
+
+# ============================================================
+# Voice input
+# ============================================================
+
+recognizer = sr.Recognizer()
+
+
+def take_command(language: str = "en-IN") -> str:
+    """Listen through the microphone and return recognized text."""
+    try:
+        with sr.Microphone() as source:
+            print("\n🎙️ Listening...")
+            recognizer.pause_threshold = 0.8
+            recognizer.dynamic_energy_threshold = True
+            recognizer.adjust_for_ambient_noise(source, duration=0.6)
+            audio = recognizer.listen(source, timeout=8, phrase_time_limit=12)
+
+        print("🔎 Recognizing...")
+        query = recognizer.recognize_google(audio, language=language)
+        print(f"You: {query}")
+        return query.strip().lower()
+
+    except sr.WaitTimeoutError:
+        print("No speech detected.")
+    except sr.UnknownValueError:
+        print("I could not understand that.")
+    except sr.RequestError as exc:
+        print(f"Speech recognition service error: {exc}")
+    except Exception as exc:
+        print(f"Microphone error: {exc}")
+
+    return ""
+
+
+# ============================================================
+# Safe calculator
+# ============================================================
+
+ALLOWED_BINOPS = {
+    ast.Add: lambda a, b: a + b,
+    ast.Sub: lambda a, b: a - b,
+    ast.Mult: lambda a, b: a * b,
+    ast.Div: lambda a, b: a / b,
+    ast.FloorDiv: lambda a, b: a // b,
+    ast.Mod: lambda a, b: a % b,
+    ast.Pow: lambda a, b: a ** b,
+}
+
+ALLOWED_UNARYOPS = {
+    ast.UAdd: lambda a: +a,
+    ast.USub: lambda a: -a,
+}
+
+
+def safe_calculate(expression: str) -> float | int:
+    """Evaluate only basic arithmetic; never execute arbitrary Python."""
+    expression = expression.replace("^", "**").strip()
+
+    if len(expression) > 100:
+        raise ValueError("Expression is too long.")
+
+    tree = ast.parse(expression, mode="eval")
+
+    def evaluate(node: ast.AST) -> float | int:
+        if isinstance(node, ast.Expression):
+            return evaluate(node.body)
+
+        if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+            return node.value
+
+        if isinstance(node, ast.BinOp) and type(node.op) in ALLOWED_BINOPS:
+            left = evaluate(node.left)
+            right = evaluate(node.right)
+
+            # Prevent accidental resource abuse.
+            if isinstance(node.op, ast.Pow) and abs(right) > 20:
+                raise ValueError("Exponent is too large.")
+
+            return ALLOWED_BINOPS[type(node.op)](left, right)
+
+        if isinstance(node, ast.UnaryOp) and type(node.op) in ALLOWED_UNARYOPS:
+            return ALLOWED_UNARYOPS[type(node.op)](evaluate(node.operand))
+
+        raise ValueError("Only basic arithmetic is supported.")
+
+    return evaluate(tree)
+
+
+# ============================================================
+# Utility actions
+# ============================================================
+
+def open_site(name: str) -> str:
+    url = SITES[name]
+    webbrowser.open(url)
+    return f"Opening {name.title()}."
+
+
+def open_app(name: str) -> str:
+    """Launch an allowlisted application."""
+    system = "windows" if platform.system() == "Windows" else "linux"
+    command = APP_COMMANDS.get(name, {}).get(system)
+
+    if not command:
+        return f"I do not have a configured launcher for {name}."
+
+    try:
+        subprocess.Popen(command)
+        return f"Opening {name}."
+    except FileNotFoundError:
+        return (
+            f"I could not find {name} on this computer. "
+            f"Install it or update APP_COMMANDS in broski.py."
+        )
+    except Exception as exc:
+        print(f"[APP] {exc}")
+        return f"I could not open {name}."
+
+
+def get_time() -> str:
+    return dt.datetime.now().strftime("%I:%M %p")
+
+
+def get_date() -> str:
+    return dt.datetime.now().strftime("%A, %d %B %Y")
+
+
+def get_system_status() -> dict[str, Any]:
+    status: dict[str, Any] = {
+        "assistant": APP_NAME,
+        "platform": platform.system(),
+        "platform_version": platform.release(),
+        "python": platform.python_version(),
+        "ai_connected": openai_client is not None,
+        "time": get_time(),
+        "date": get_date(),
+    }
+
+    if psutil:
+        status["cpu_percent"] = psutil.cpu_percent(interval=0.2)
+        status["memory_percent"] = psutil.virtual_memory().percent
+        status["disk_percent"] = psutil.disk_usage("/").percent
+
+    return status
+
+
+def save_note(note: str) -> str:
+    note = note.strip()
+    if not note:
+        return "Please tell me what you want me to save."
+
+    timestamp = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with NOTES_FILE.open("a", encoding="utf-8") as file:
+        file.write(f"[{timestamp}] {note}\n")
+
+    return "I saved that note."
+
+
+def read_notes() -> str:
+    if not NOTES_FILE.exists():
+        return "You do not have any saved notes yet."
+
+    content = NOTES_FILE.read_text(encoding="utf-8").strip()
+    if not content:
+        return "You do not have any saved notes yet."
+
+    # Avoid speaking an unlimited file.
+    lines = content.splitlines()[-10:]
+    return "Here are your latest notes:\n" + "\n".join(lines)
+
+
+def search_wikipedia(topic: str) -> str:
+    topic = topic.strip()
+    if not topic:
+        return "Tell me what you want me to search on Wikipedia."
+
+    try:
+        result = wikipedia.summary(topic, sentences=3, auto_suggest=True)
+        return f"According to Wikipedia:\n{result}"
+    except wikipedia.exceptions.DisambiguationError as exc:
+        options = ", ".join(exc.options[:5])
+        return f"That topic is ambiguous. Try one of these: {options}."
+    except Exception as exc:
+        print(f"[Wikipedia] {exc}")
+        return "I could not find a Wikipedia result for that."
+
+
+# ============================================================
+# Command router
+# ============================================================
+
+def handle_command(raw_text: str) -> dict[str, Any]:
+    """
+    Convert a user request into a local action or an AI response.
+
+    This is the central brain of Broski. Add new commands here as the
+    project grows.
+    """
+    text = re.sub(r"\s+", " ", raw_text.strip())
+    lower = text.lower()
+
+    if not text:
+        return {"ok": False, "type": "empty", "reply": "I did not hear anything."}
+
+    # ---- Exit ----
+    if lower in {"exit", "quit", "stop", "goodbye", "shutdown broski"}:
+        return {"ok": True, "type": "exit", "reply": "Goodbye. Broski is shutting down."}
+
+    # ---- Time/date ----
+    if lower in {"time", "what is the time", "what's the time", "tell me the time"}:
+        return {"ok": True, "type": "time", "reply": f"The time is {get_time()}."}
+
+    if lower in {"date", "what is the date", "what's the date", "today's date"}:
+        return {"ok": True, "type": "date", "reply": f"Today is {get_date()}."}
+
+    # ---- Websites ----
+    for site in SITES:
+        if re.search(rf"\bopen\s+{re.escape(site)}\b", lower):
+            return {"ok": True, "type": "website", "reply": open_site(site)}
+
+    # ---- Apps ----
+    app_aliases = {
+        "visual studio code": "code",
+        "vs code": "code",
+        "vscode": "code",
+        "calculator": "calculator",
+        "terminal": "terminal",
+        "file manager": "files",
+        "files": "files",
+    }
+
+    for phrase, app_name in app_aliases.items():
+        if lower in {f"open {phrase}", phrase}:
+            return {"ok": True, "type": "app", "reply": open_app(app_name)}
+
+    # ---- Wikipedia ----
+    wiki_match = re.match(
+        r"^(?:search\s+)?(?:wikipedia|wiki)\s+(?:for\s+)?(.+)$",
+        lower,
+    )
+    if wiki_match:
+        topic = wiki_match.group(1).strip()
+        return {
+            "ok": True,
+            "type": "wikipedia",
+            "reply": search_wikipedia(topic),
+        }
+
+    # ---- Calculator ----
+    calc_match = re.match(
+        r"^(?:calculate|calculator|solve)\s+(.+)$",
+        lower,
+    )
+    if calc_match:
+        try:
+            result = safe_calculate(calc_match.group(1))
+            return {
+                "ok": True,
+                "type": "calculator",
+                "reply": f"The answer is {result}.",
+                "result": result,
+            }
+        except Exception:
+            return {
+                "ok": False,
+                "type": "calculator",
+                "reply": "I can only calculate basic arithmetic expressions.",
+            }
+
+    # ---- Notes ----
+    note_match = re.match(
+        r"^(?:remember|save note|take a note|note)\s+(.+)$",
+        lower,
+    )
+    if note_match:
+        # Use the original text after the command where possible.
+        note = re.sub(
+            r"^(?:remember|save note|take a note|note)\s+",
+            "",
+            text,
+            flags=re.IGNORECASE,
+        )
+        return {"ok": True, "type": "note", "reply": save_note(note)}
+
+    if lower in {"read my notes", "show my notes", "read notes"}:
+        return {"ok": True, "type": "notes", "reply": read_notes()}
+
+    # ---- System status ----
+    if lower in {
+        "system status",
+        "computer status",
+        "system information",
+        "computer information",
+        "how is my computer",
+    }:
+        status = get_system_status()
+        if "cpu_percent" in status:
+            reply = (
+                f"CPU is at {status['cpu_percent']} percent, "
+                f"memory is at {status['memory_percent']} percent, "
+                f"and disk is at {status['disk_percent']} percent."
+            )
+        else:
+            reply = (
+                f"You are running {status['platform']} with Python "
+                f"{status['python']}."
+            )
+
+        return {
+            "ok": True,
+            "type": "system_status",
+            "reply": reply,
+            "data": status,
+        }
+
+    # ---- Basic conversational shortcuts ----
+    if lower in {"hello", "hi", "hey", "hey broski", "hello broski"}:
+        return {
+            "ok": True,
+            "type": "conversation",
+            "reply": "Hey! Broski is online. What do you want me to do?",
+        }
+
+    if "who are you" in lower or "what are you" in lower:
+        return {
+            "ok": True,
+            "type": "conversation",
+            "reply": (
+                "I am Broski, your local personal AI assistant. "
+                "I can handle voice commands, websites, apps, notes, "
+                "system information, Wikipedia, calculations, and AI chat."
+            ),
+        }
+
+    # ---- AI fallback ----
+    reply = ask_ai(text)
+    return {"ok": True, "type": "ai", "reply": reply}
+
+
+# ============================================================
+# Flask API for Broski website
+# ============================================================
+
+@app.get("/")
+def home():
+    """Serve a simple health response.
+
+    If your project has static/broski-index.html, the frontend can call
+    /api/command or /api/chat. You can also replace this route with
+    render_template() later.
+    """
+    return jsonify(
+        {
+            "assistant": APP_NAME,
+            "status": "online",
+            "message": "Broski backend is running.",
+            "endpoints": ["/api/status", "/api/command", "/api/chat"],
+        }
+    )
+
+
+@app.get("/api/status")
+def api_status():
+    return jsonify(
+        {
+            "ok": True,
+            "status": "online",
+            "data": get_system_status(),
+        }
+    )
+
+
+@app.post("/api/command")
+def api_command():
+    data = request.get_json(silent=True) or {}
+    text = data.get("text", "")
+
+    if not isinstance(text, str):
+        return jsonify({"ok": False, "reply": "Command must be text."}), 400
+
+    result = handle_command(text)
+
+    # Speak server-side responses when requested by the frontend.
+    if data.get("speak", False) and result.get("reply"):
+        speak(result["reply"])
+
+    return jsonify(result)
+
+
+@app.post("/api/chat")
+def api_chat():
+    data = request.get_json(silent=True) or {}
+    text = data.get("message", "")
+
+    if not isinstance(text, str) or not text.strip():
+        return jsonify({"ok": False, "reply": "Please send a message."}), 400
+
+    result = handle_command(text)
+    return jsonify(result)
+
+
+# ============================================================
+# CLI voice mode
+# ============================================================
+
+def wish_me() -> None:
+    hour = dt.datetime.now().hour
+
+    if 0 <= hour < 12:
+        greeting = "Good morning"
+    elif 12 <= hour < 18:
+        greeting = "Good afternoon"
+    else:
+        greeting = "Good evening"
+
+    print(f"{greeting}! I am {APP_NAME}.")
+    speak(f"{greeting}! I am {APP_NAME}. How can I help you today?")
+
+
+def run_voice_mode() -> None:
+    wish_me()
+
+    while True:
+        query = take_command()
+
+        if not query:
+            continue
+
+        result = handle_command(query)
+        reply = result.get("reply", "")
+        print(f"\n{APP_NAME}: {reply}\n")
+        speak(reply)
+
+        if result.get("type") == "exit":
+            break
+
+
+# ============================================================
+# Entry point
+# ============================================================
+
+if __name__ == "__main__":
+    print("=" * 60)
+    print("Broski AI is starting...")
+    print(f"Local API: http://{HOST}:{PORT}")
+    print(f"OpenAI connected: {'YES' if openai_client else 'NO'}")
+    print("=" * 60)
+
+    # Default behavior is web/API mode because your Broski website can
+    # communicate with this backend. Set BROSKI_VOICE_MODE=1 for microphone mode.
+    if os.getenv("BROSKI_VOICE_MODE", "0") == "1":
+        run_voice_mode()
+    else:
+        app.run(host=HOST, port=PORT, debug=False)
